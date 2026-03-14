@@ -1,0 +1,19 @@
+# Moonshine Streaming-Medium ASR Server
+# Core
+fastapi
+uvicorn[standard]
+python-multipart
+
+# ML / Inference
+transformers>=4.48.0
+torch
+torchaudio
+soundfile
+librosa
+numpy
+
+# ONNX (optional, for optimised path)
+onnxruntime
+
+# Utilities
+pydantic
