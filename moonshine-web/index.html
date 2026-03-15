@@ -15,7 +15,10 @@
           var s = (url instanceof URL ? url.href : String(url));
           if (s.indexOf("worker-D9nS5ej1") !== -1 || s.indexOf("worker-BrsEphLD") !== -1) {
             console.log("[moonshine] Using API worker → http://127.0.0.1:8001");
-            return new Orig(new URL("/assets/worker-api.js", location.origin), opts);
+            const w = new Orig(new URL("/assets/worker-api.js", location.origin), opts);
+            // Store global reference so model selector can message the worker
+            window.__moonshine_worker = w;
+            return w;
           }
           return new Orig(url, opts);
         };
@@ -26,6 +29,68 @@
     <link rel="stylesheet" crossorigin href="/assets/index-Br9ehX_t.css">
   </head>
   <body>
+    <div id="model-selector" style="position: fixed; top: 10px; right: 10px; background: rgba(255,255,255,0.9); padding: 12px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); z-index: 9999; font-family: system-ui, -apple-system, sans-serif; font-size: 13px;">
+      <label style="display: block; margin-bottom: 8px; font-weight: 600; color: #333;">ASR Model:</label>
+      <div style="display: flex; gap: 12px;">
+        <label style="display: flex; align-items: center; gap: 6px; cursor: pointer;">
+          <input type="radio" name="asr_model" value="moonshine" id="model_moonshine" style="cursor: pointer;">
+          <span id="moonshine_label">Moonshine</span>
+        </label>
+        <label style="display: flex; align-items: center; gap: 6px; cursor: pointer;">
+          <input type="radio" name="asr_model" value="whisper" id="model_whisper" style="cursor: pointer;">
+          <span id="whisper_label">Whisper</span>
+        </label>
+      </div>
+      <div id="model_status" style="margin-top: 8px; font-size: 12px; color: #666;"></div>
+    </div>
+    <script>
+      // Model selector logic
+      (function() {
+        const MODEL_KEY = 'asr_model';
+        const DEFAULT_MODEL = 'moonshine';
+        
+        // Initialize model selection from localStorage
+        const saved = localStorage.getItem(MODEL_KEY) || DEFAULT_MODEL;
+        const radio = document.querySelector(`input[name="asr_model"][value="${saved}"]`);
+        if (radio) radio.checked = true;
+        updateStatusLabel(saved);
+        
+        // Listen for radio button changes
+        document.querySelectorAll('input[name="asr_model"]').forEach(radio => {
+          radio.addEventListener('change', function() {
+            localStorage.setItem(MODEL_KEY, this.value);
+            updateStatusLabel(this.value);
+            console.log('[moonshine] Model switched to:', this.value);
+            // Send model selection to worker
+            if (window.__moonshine_worker && window.__moonshine_worker.postMessage) {
+              window.__moonshine_worker.postMessage({ type: 'set-asr-model', model: this.value });
+              console.log('[moonshine] Sent to worker: set model to', this.value);
+            }
+          });
+        });
+        
+        // On page load, send initial model selection to worker when it's ready
+        // (use a small delay to ensure worker is created)
+        setTimeout(() => {
+          const saved = localStorage.getItem(MODEL_KEY) || DEFAULT_MODEL;
+          if (window.__moonshine_worker && window.__moonshine_worker.postMessage) {
+            window.__moonshine_worker.postMessage({ type: 'set-asr-model', model: saved });
+            console.log('[moonshine] Sent initial model to worker:', saved);
+          }
+        }, 100);
+        
+        function updateStatusLabel(model) {
+          const status = document.getElementById('model_status');
+          if (model === 'whisper') {
+            status.textContent = '✓ Using Whisper (ggml-small)';
+            status.style.color = '#0a7;';
+          } else {
+            status.textContent = '✓ Using Moonshine';
+            status.style.color = '#0a7;';
+          }
+        }
+      })();
+    </script>
     <div id="root"></div>
     <script id="vertexshader" type="vertex">
       uniform float u_time;

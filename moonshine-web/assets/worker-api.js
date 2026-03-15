@@ -26,6 +26,7 @@ let preSpeechRing = [];            // circular buffer before speech onset
 let isSpeaking = false;
 let silenceChunks = 0;
 let busy = false;                  // guard against overlapping API calls
+let selectedModel = 'moonshine';   // holds the selected ASR model from main thread
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
@@ -80,7 +81,13 @@ async function transcribeAudio(pcm) {
   const fd = new FormData();
   fd.append("file", new Blob([wav], { type: "audio/wav" }), "audio.wav");
 
-  const res = await fetch(`${API_BASE}/v1/transcribe`, {
+  // Route based on selectedModel
+  const endpoint = selectedModel === 'whisper'
+    ? `${API_BASE}/v1/transcribe/whisper`
+    : `${API_BASE}/v1/transcribe`;
+  console.log('[worker-api] Routing transcription to:', endpoint, '(model:', selectedModel + ')');
+
+  const res = await fetch(endpoint, {
     method: "POST",
     body: fd,
   });
@@ -140,7 +147,22 @@ async function flushSegment() {
 // ── Incoming audio chunk handler ────────────────────────────────────
 
 self.onmessage = (e) => {
-  const { buffer } = e.data;
+  const data = e.data;
+  
+  // Handle control messages from main thread
+  if (data && data.type === 'set-asr-model') {
+    selectedModel = data.model || 'moonshine';
+    console.log('[worker-api] Model set to:', selectedModel);
+    self.postMessage({
+      type: 'status',
+      status: 'model_changed',
+      message: `Model: ${selectedModel}`
+    });
+    return;
+  }
+  
+  // Handle audio buffer messages (existing behavior)
+  const buffer = data && data.buffer;
   if (!buffer || busy) return;
 
   const energy = rms(buffer);

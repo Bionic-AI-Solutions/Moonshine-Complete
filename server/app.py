@@ -16,6 +16,9 @@ import io
 import os
 import time
 import threading
+import subprocess
+import tempfile
+import json
 from pathlib import Path
 
 import numpy as np
@@ -29,6 +32,20 @@ from pydantic import BaseModel
 _HERE = Path(__file__).resolve().parent
 MODEL_DIR = str(_HERE.parent / "moonshine-streaming-medium")
 TARGET_SR = 16_000  # model expects 16 kHz mono
+
+# Whisper ggml configuration
+WHISPER_CPP_BIN = os.getenv(
+    "WHISPER_CPP_BIN",
+    str(_HERE.parent / "whisper-bin-x64" / "Release" / "whisper-cli.exe")
+)
+GGML_WHISPER_MODEL = os.getenv(
+    "GGML_WHISPER_MODEL",
+    str(_HERE.parent / "ggml-small.bin")
+)
+WHISPER_MAX_CONCURRENCY = int(os.getenv("WHISPER_MAX_CONCURRENCY", "2"))
+
+# Semaphore to limit concurrent whisper subprocess invocations
+_whisper_semaphore = threading.Semaphore(WHISPER_MAX_CONCURRENCY)
 
 # ---------------------------------------------------------------------------
 # App
@@ -148,6 +165,68 @@ class HealthResponse(BaseModel):
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
+def _transcribe_with_whisper(audio_bytes: bytes) -> tuple[str, float, float]:
+    """
+    Invoke whisper-cli.exe subprocess to transcribe audio.
+    Returns: (text, duration_s, processing_time_s)
+    """
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as audio_file:
+        audio_file.write(audio_bytes)
+        audio_path = audio_file.name
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        output_prefix = str(Path(tmpdir) / "whisper_output")
+        
+        try:
+            # Load audio to get duration
+            audio_data = _load_audio_bytes(audio_bytes)
+            duration_s = len(audio_data) / TARGET_SR
+
+            t0 = time.perf_counter()
+            
+            # Run whisper-cli.exe with subprocess
+            cmd = [
+                WHISPER_CPP_BIN,
+                "-m", GGML_WHISPER_MODEL,
+                "-f", audio_path,
+                "-t", "4",  # use 4 threads
+                "-otxt",    # output text format
+                "-of", output_prefix,  # output file prefix
+            ]
+
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+
+            processing_time = time.perf_counter() - t0
+
+            if result.returncode != 0:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Whisper transcription failed: {result.stderr}",
+                )
+
+            # Read transcribed text from output file
+            output_txt_path = Path(output_prefix + ".txt")
+            if not output_txt_path.exists():
+                raise HTTPException(
+                    status_code=500,
+                    detail="Whisper did not produce output file",
+                )
+
+            text = output_txt_path.read_text(encoding="utf-8").strip()
+
+            return text, round(duration_s, 3), round(processing_time, 3)
+
+        finally:
+            # Clean up audio temp file
+            if os.path.exists(audio_path):
+                os.unlink(audio_path)
+
+
 @app.post("/v1/transcribe", response_model=TranscribeResponse)
 async def transcribe(file: UploadFile = File(...)):
     """Upload a WAV/MP3/FLAC/OGG audio file and get back the transcription."""
@@ -198,6 +277,62 @@ async def transcribe(file: UploadFile = File(...)):
         text=text.strip(),
         duration_s=round(duration_s, 3),
         processing_time_s=round(processing_time, 3),
+    )
+
+
+@app.post("/v1/transcribe/whisper", response_model=TranscribeResponse)
+async def transcribe_whisper(file: UploadFile = File(...)):
+    """Upload a WAV/MP3/FLAC/OGG audio file and get back transcription using Whisper ggml."""
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No file uploaded.")
+
+    # Verify whisper binary and model exist
+    if not os.path.exists(WHISPER_CPP_BIN):
+        raise HTTPException(
+            status_code=500,
+            detail=f"Whisper binary not found: {WHISPER_CPP_BIN}",
+        )
+    if not os.path.exists(GGML_WHISPER_MODEL):
+        raise HTTPException(
+            status_code=500,
+            detail=f"Whisper model not found: {GGML_WHISPER_MODEL}",
+        )
+
+    raw = await file.read()
+    if len(raw) == 0:
+        raise HTTPException(status_code=400, detail="Empty audio file.")
+
+    try:
+        # Convert to WAV if needed
+        audio = _load_audio_bytes(raw)
+        # Re-encode as WAV for whisper subprocess
+        import soundfile as sf
+        wav_bytes = io.BytesIO()
+        sf.write(wav_bytes, audio, TARGET_SR, format='WAV')
+        wav_bytes.seek(0)
+        audio_bytes = wav_bytes.read()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Could not decode audio: {exc}",
+        )
+
+    # Limit concurrent whisper invocations
+    with _whisper_semaphore:
+        try:
+            text, duration_s, processing_time = _transcribe_with_whisper(audio_bytes)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Transcription error: {exc}",
+            )
+
+    return TranscribeResponse(
+        text=text,
+        duration_s=duration_s,
+        processing_time_s=processing_time,
     )
 
 
